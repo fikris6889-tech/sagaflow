@@ -1,0 +1,17 @@
+# Runtime dependencies for the DEPLOYED Lambda functions
+# (src/common/dynamo_adapters.py, src/handlers/start_order.py's lambda_handler).
+#
+# boto3 / botocore are NOT bundled by `sam build` for this template --
+# the AWS Lambda Python 3.11 managed runtime ships them preinstalled, at
+# the exact versions below at the time this project was built. Pinned
+# here anyway so `pip install -r requirements.txt` gives a local
+# interpreter the same versions, if you ever want to poke at
+# src/common/dynamo_adapters.py directly against a real AWS account
+# (e.g. with `AWS_PROFILE=... python3`) outside of Lambda.
+#
+# The test suite (tests/) needs NONE of this -- every test runs against
+# src/common/fake_adapters.py, pure Python 3.11 standard library only,
+# specifically so `python3 -m unittest discover -s tests` works with a
+# stock Python 3.11 interpreter and no package installation step at all.
+boto3==1.35.36
+botocore==1.35.36

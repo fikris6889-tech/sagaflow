@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SagaFlow -- a distributed order-processing saga (AWS Step Functions +
+  Lambda + DynamoDB) implementing the Saga pattern with compensating
+  transactions, idempotent retries, and optimistic-concurrency inventory
+  control. Every resource below is chosen to fit entirely inside AWS's
+  Always Free tier (see README.md's "Cost / free-tier fit" section for
+  the exact numbers this was checked against) -- there is deliberately
+  no API Gateway REST API in this template, since API Gateway is NOT
+  part of the Always Free tier (only a 12-month free allowance that a
+  pre-existing AWS account may have already used up); the HTTP entry
+  point instead uses a Lambda Function URL, which has no charge of its
+  own beyond standard Lambda invocation pricing.
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 10
+    MemorySize: 128
+    Tracing: Active
+    Environment:
+      Variables:
+        INVENTORY_TABLE_NAME: !Ref InventoryTable
+        IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+        ORDER_TABLE_NAME: !Ref OrderTable
+
+Resources:
+  # ---------------------------------------------------------------------
+  # DynamoDB tables. All three use PROVISIONED billing at 1 RCU / 1 WCU
+  # each (3 RCU + 3 WCU total across the whole app), comfortably inside
+  # the account-wide Always Free allowance of 25 RCU + 25 WCU -- that
+  # allowance is per ACCOUNT, not per table, so it is shared across all
+  # three and still leaves headroom for the account's other tables.
+  # ---------------------------------------------------------------------
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SagaFlow-Inventory
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 }
+      AttributeDefinitions:
+        - { AttributeName: sku, AttributeType: S }
+      KeySchema:
+        - { AttributeName: sku, KeyType: HASH }
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SagaFlow-Idempotency
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 }
+      AttributeDefinitions:
+        - { AttributeName: idempotency_key, AttributeType: S }
+      KeySchema:
+        - { AttributeName: idempotency_key, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SagaFlow-Orders
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 }
+      AttributeDefinitions:
+        - { AttributeName: order_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: order_id, KeyType: HASH }
+
+  # ---------------------------------------------------------------------
+  # One Lambda function per saga step, each least-privilege: it can only
+  # touch the exact table(s) its own src/handlers/*.py file actually
+  # calls (see each function's Policies block), never all three.
+  # ---------------------------------------------------------------------
+  ReserveInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-ReserveInventory
+      Handler: src.handlers.reserve_inventory.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref InventoryTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  ReleaseInventoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-ReleaseInventory
+      Handler: src.handlers.release_inventory.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref InventoryTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  ChargePaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-ChargePayment
+      Handler: src.handlers.charge_payment.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  RefundPaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-RefundPayment
+      Handler: src.handlers.refund_payment.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  CreateShipmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-CreateShipment
+      Handler: src.handlers.create_shipment.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  FinalizeOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-FinalizeOrder
+      Handler: src.handlers.finalize_order.lambda_handler
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OrderTable }
+
+  StartOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SagaFlow-StartOrder
+      Handler: src.handlers.start_order.lambda_handler
+      CodeUri: .
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref OrderSagaStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref OrderSagaStateMachine
+      FunctionUrlConfig:
+        AuthType: AWS_IAM   # see README.md "Calling it" section for how to sign requests (SigV4); this keeps the free-tier deploy from being an open, unauthenticated write endpoint on the public internet.
+
+  # ---------------------------------------------------------------------
+  # The saga itself. STANDARD workflow type (not EXPRESS) specifically
+  # because Standard executions are individually queryable/inspectable
+  # (GetExecutionHistory) after the fact, which matters for a saga where
+  # "what actually happened to this order" is a real operational
+  # question -- Express workflows only keep execution history in
+  # CloudWatch Logs. Standard's 4,000-state-transitions/month Always
+  # Free allowance is what this template is scoped against; see
+  # README.md for the math.
+  # ---------------------------------------------------------------------
+  OrderSagaStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: SagaFlow-OrderSaga
+      Type: STANDARD
+      DefinitionUri: statemachine/order_saga.asl.json
+      DefinitionSubstitutions:
+        reserve_inventory: !GetAtt ReserveInventoryFunction.Arn
+        release_inventory: !GetAtt ReleaseInventoryFunction.Arn
+        charge_payment: !GetAtt ChargePaymentFunction.Arn
+        refund_payment: !GetAtt RefundPaymentFunction.Arn
+        create_shipment: !GetAtt CreateShipmentFunction.Arn
+        finalize_order: !GetAtt FinalizeOrderFunction.Arn
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref ReserveInventoryFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref ReleaseInventoryFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref ChargePaymentFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref RefundPaymentFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref CreateShipmentFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref FinalizeOrderFunction }
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref OrderSagaStateMachine
+  StartOrderFunctionUrl:
+    Description: Invoke with a SigV4-signed POST (see README.md) to start a new order saga.
+    Value: !GetAtt StartOrderFunctionUrl.FunctionUrl

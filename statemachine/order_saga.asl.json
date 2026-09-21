@@ -1,0 +1,165 @@
+{
+  "Comment": "SagaFlow order-processing saga. Forward path: ReserveInventory -> ChargePayment -> CreateShipment -> FinalizeOrder. Each forward Task retries transient failures and, on any failure it cannot recover from, routes into the minimal compensation branch needed to undo exactly what has already succeeded. See src/handlers/*.py for what each Resource actually does and why each Catch target was chosen.",
+  "StartAt": "ReserveInventory",
+  "States": {
+    "ReserveInventory": {
+      "Type": "Task",
+      "Resource": "${reserve_inventory}",
+      "Comment": "Nothing has succeeded yet at this point, so its Catch needs no compensation branch.",
+      "Retry": [
+        {
+          "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["InsufficientInventoryError"],
+          "ResultPath": "$.error",
+          "Next": "OrderFailedNoCompensation"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Comment": "Safety net: an unexpected error, or a transient error whose retry budget was exhausted, is treated the same as an explicit business failure here rather than left as an unclean execution failure -- see this file's header comment and README.md's 'Design decisions' section.",
+          "ResultPath": "$.error",
+          "Next": "OrderFailedNoCompensation"
+        }
+      ],
+      "Next": "ChargePayment"
+    },
+    "ChargePayment": {
+      "Type": "Task",
+      "Resource": "${charge_payment}",
+      "Comment": "Inventory is already reserved by this point, so its Catch must release it.",
+      "Retry": [
+        {
+          "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["PaymentDeclinedError"],
+          "ResultPath": "$.error",
+          "Next": "CompensateReleaseInventoryOnly"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CompensateReleaseInventoryOnly"
+        }
+      ],
+      "Next": "CreateShipment"
+    },
+    "CreateShipment": {
+      "Type": "Task",
+      "Resource": "${create_shipment}",
+      "Comment": "Inventory AND payment have already succeeded by this point, so its Catch must undo both.",
+      "Retry": [
+        {
+          "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["ShipmentError"],
+          "ResultPath": "$.error",
+          "Next": "CompensateRefundAndRelease"
+        },
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "CompensateRefundAndRelease"
+        }
+      ],
+      "Next": "FinalizeOrder"
+    },
+    "FinalizeOrder": {
+      "Type": "Task",
+      "Resource": "${finalize_order}",
+      "Comment": "Deliberately no Catch: by this point the shipment has already been created with the carrier, so a failure here is an operational issue for a human, not a business failure this saga can compensate. See create_shipment.py's docstring and README.md's 'Known limitations' section.",
+      "Retry": [
+        {
+          "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "CompensateReleaseInventoryOnly": {
+      "Type": "Task",
+      "Resource": "${release_inventory}",
+      "Retry": [
+        {
+          "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "OrderFailedAfterCompensation"
+    },
+    "CompensateRefundAndRelease": {
+      "Type": "Parallel",
+      "Comment": "Refunding the charge and releasing the reserved stock are independent of each other, so they run concurrently rather than being forced to serialize.",
+      "Branches": [
+        {
+          "StartAt": "RefundPayment",
+          "States": {
+            "RefundPayment": {
+              "Type": "Task",
+              "Resource": "${refund_payment}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ReleaseInventoryAfterShipmentFailure",
+          "States": {
+            "ReleaseInventoryAfterShipmentFailure": {
+              "Type": "Task",
+              "Resource": "${release_inventory}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["OptimisticLockConflict", "ThrottledError", "States.Timeout", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "OrderFailedAfterCompensation"
+    },
+    "OrderFailedNoCompensation": {
+      "Type": "Fail",
+      "Error": "OrderFailed",
+      "Cause": "Insufficient inventory at reservation time (or an unrecoverable error before any step succeeded); no compensation was required."
+    },
+    "OrderFailedAfterCompensation": {
+      "Type": "Fail",
+      "Error": "OrderFailedCompensated",
+      "Cause": "A downstream step failed permanently; all prior successful steps were compensated before failing the order."
+    }
+  }
+}
